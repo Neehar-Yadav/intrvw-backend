@@ -328,6 +328,7 @@ app.post('/api/payment/create-order', checkAuth, requireUser, async (req, res) =
   }
 
   const orderId = `INTRVW-${planId.toUpperCase()}-${Date.now()}`
+  const mode = owner ? 'sandbox' : 'production'
   try {
     const data = await cashfreeReq(creds, 'POST', '/orders', {
       order_id: orderId,
@@ -338,18 +339,52 @@ app.post('/api/payment/create-order', checkAuth, requireUser, async (req, res) =
         customer_email: req.user.email || 'user@intrvw.app',
         customer_phone: '9999999999'
       },
-      order_meta: { return_url: `https://intrvw.app/payment-success?order_id=${orderId}` }
+      order_meta: { return_url: `https://${req.get('host')}/pay-done?order_id=${orderId}` }
     })
     if (!data.payment_session_id) {
       console.error('[cashfree create]', JSON.stringify(data))
       return res.json({ error: 'Could not create order.' })
     }
-    const paymentUrl = `https://${creds.payHost}/order/#${data.payment_session_id}`
+    // Point the app at our own checkout page, which loads the Cashfree SDK correctly
+    const base = `https://${req.get('host')}`
+    const paymentUrl = `${base}/pay?session=${encodeURIComponent(data.payment_session_id)}&mode=${mode}`
     return res.json({ orderId, paymentUrl })
   } catch (err) {
     console.error('[cashfree create]', err.message)
     return res.json({ error: err.message })
   }
+})
+
+// Hosted checkout page — loads the Cashfree JS SDK and starts checkout properly.
+app.get('/pay', (req, res) => {
+  const session = req.query.session || ''
+  const mode = req.query.mode === 'production' ? 'production' : 'sandbox'
+  res.setHeader('Content-Type', 'text/html')
+  res.end(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Redirecting to payment…</title>
+<script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+<style>body{font-family:sans-serif;background:#16140f;color:#f0a500;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}</style>
+</head><body>
+<h2>Opening secure payment…</h2>
+<script>
+  (function(){
+    try {
+      var cashfree = Cashfree({ mode: "${mode}" });
+      cashfree.checkout({ paymentSessionId: ${JSON.stringify(session)}, redirectTarget: "_self" });
+    } catch (e) {
+      document.body.innerHTML = '<h2>Could not open payment. Please return to the app and try again.</h2>';
+    }
+  })();
+</script>
+</body></html>`)
+})
+
+// Simple post-payment landing page
+app.get('/pay-done', (_, res) => {
+  res.setHeader('Content-Type', 'text/html')
+  res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment complete</title>
+<style>body{font-family:sans-serif;background:#16140f;color:#f0a500;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}</style>
+</head><body><div><h2>Payment received!</h2><p style="color:#bbb">Return to Intrvw and click "I have paid — verify now".</p></div></body></html>`)
 })
 
 app.post('/api/payment/verify', checkAuth, requireUser, async (req, res) => {
