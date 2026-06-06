@@ -145,10 +145,19 @@ app.post('/api/audio', checkAuth, async (req, res) => {
 
   try {
     // Run diarization (interviewers) and mic transcription (you) in parallel
-    const [sysUtterances, micSegments] = await Promise.all([
+    let [sysUtterances, micSegments] = await Promise.all([
       sysSource ? deepgramDiarize(sysSource).catch(e => { console.error('[deepgram]', e.message); return [] }) : Promise.resolve([]),
       micAudio  ? transcribeMic(micAudio).catch(e => { console.error('[mic]', e.message); return [] })       : Promise.resolve([])
     ])
+
+    // Fallback: if diarization gave nothing (no Deepgram key, silence, or 1 speaker),
+    // transcribe the system audio with Whisper so the interviewer's question isn't lost.
+    let sysFellBack = false
+    if (sysSource && sysUtterances.length === 0) {
+      const segs = await transcribeMic(sysSource).catch(e => { console.error('[sys-fallback]', e.message); return [] })
+      sysUtterances = segs.map(s => ({ speaker: 0, text: s.text, start: s.start }))
+      sysFellBack = true
+    }
 
     // Map Deepgram speaker numbers → "Interviewer N" (stable per request)
     const speakerMap = {}
@@ -160,9 +169,11 @@ app.post('/api/audio', checkAuth, async (req, res) => {
 
     // Build a unified, time-ordered, labeled transcript
     const lines = []
-    for (const u of sysUtterances) lines.push({ start: u.start, label: interviewerLabel(u.speaker), text: u.text })
+    for (const u of sysUtterances) lines.push({ start: u.start, label: sysFellBack ? 'Interviewer' : interviewerLabel(u.speaker), text: u.text })
     for (const s of micSegments)   lines.push({ start: s.start, label: 'You', text: s.text })
     lines.sort((a, b) => a.start - b.start)
+
+    console.log('[audio] sys utterances:', sysUtterances.length, 'mic segs:', micSegments.length, 'fallback:', sysFellBack)
 
     // Merge consecutive lines from the same speaker for readability
     const merged = []
@@ -178,12 +189,12 @@ app.post('/api/audio', checkAuth, async (req, res) => {
     }
 
     // Answer the interviewer's question(s) using the labeled transcript
-    let systemMsg = `You are helping an Indian candidate in a live job interview. Below is a snippet of the conversation with speaker labels — "You" is the candidate, "Interviewer 1/2/3" are the people interviewing.
+    let systemMsg = `You are helping an Indian candidate in a live job interview. Below is a snippet of the conversation with speaker labels — "You" is the candidate, "Interviewer" / "Interviewer 1/2/3" are the people interviewing.
 
-Find the most recent question(s) asked by ANY interviewer and write the answer the candidate should say. Ignore lines spoken by "You" except as context.
+Find the most recent question or topic the candidate needs to respond to and write the answer the candidate should say. The question is usually from an Interviewer, but if labels are unclear, just answer the most recent question in the snippet.
 
 Respond EXACTLY like this:
-QUESTION: <the interviewer's question, and which interviewer asked it>
+QUESTION: <the question being answered>
 ANSWER: <the answer — see length rules below>
 
 LENGTH RULES:
@@ -191,7 +202,7 @@ LENGTH RULES:
 - For all other questions: 3-5 sentences.
 
 Use the EXACT details from the resume — real college, project names, skills. Never be vague.
-Only respond with the single word SKIP if there is no interviewer question at all (just chit-chat or noise).`
+Only respond with the single word SKIP if the snippet has no question or topic at all — just pure noise or silence.`
     if (role) systemMsg += `\nRole being interviewed for: ${role}`
     if (resume) systemMsg += `\nCandidate's resume (use these exact details):\n${resume}`
 
