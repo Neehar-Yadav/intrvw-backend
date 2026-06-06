@@ -7,12 +7,41 @@ const os = require('os')
 const path = require('path')
 const https = require('https')
 const Groq = require('groq-sdk')
+const jwt = require('jsonwebtoken')
+const { OAuth2Client } = require('google-auth-library')
 
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '25mb' })) // audio/screenshots can be large
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+
+// ── Google auth setup ────────────────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
+const JWT_SECRET           = process.env.APP_SECRET || 'dev-secret'
+// Emails that get free TEST mode (comma-separated in OWNER_EMAILS)
+const OWNER_EMAILS = (process.env.OWNER_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+
+function isOwner(email) {
+  return OWNER_EMAILS.includes((email || '').toLowerCase())
+}
+
+// Verify the session token the app sends after login; attaches req.user
+function requireUser(req, res, next) {
+  const header = req.headers.authorization || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  if (!token) return res.status(401).json({ error: 'Login required' })
+  try {
+    req.user = jwt.verify(token, JWT_SECRET)
+    next()
+  } catch {
+    return res.status(401).json({ error: 'Session expired — please sign in again' })
+  }
+}
 
 // Optional shared secret so only your app can call this backend.
 // Set APP_SECRET in the backend .env and the same value in the desktop app.
@@ -25,6 +54,38 @@ function checkAuth(req, res, next) {
 
 // ── Health check ───────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({ ok: true, service: 'intrvw-backend' }))
+
+// ── Google login ──────────────────────────────────────────────────────────────────
+// The app sends the authorization code + the redirect URI it used. We exchange it
+// for tokens, verify the identity, and issue our own session token (JWT).
+app.post('/api/auth/google', checkAuth, async (req, res) => {
+  const { code, redirectUri } = req.body
+  if (!code || !redirectUri) return res.status(400).json({ error: 'Missing code' })
+
+  try {
+    const { tokens } = await googleClient.getToken({ code, redirect_uri: redirectUri })
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: GOOGLE_CLIENT_ID
+    })
+    const payload = ticket.getPayload()
+    const email = payload.email
+    const name  = payload.name || ''
+    const picture = payload.picture || ''
+
+    // Sign a 30-day session token the app will send with future requests
+    const sessionToken = jwt.sign(
+      { email, name, owner: isOwner(email) },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    )
+
+    return res.json({ token: sessionToken, email, name, picture, owner: isOwner(email) })
+  } catch (err) {
+    console.error('[auth]', err.message)
+    return res.status(401).json({ error: 'Google sign-in failed. Try again.' })
+  }
+})
 
 // ── Audio: transcribe + answer ──────────────────────────────────────────────────
 app.post('/api/audio', checkAuth, async (req, res) => {
@@ -205,18 +266,34 @@ const PLAN_CONFIG = {
   'yearly':  { amount: 5999, creditsMinutes: 0,   planType: 'yearly',  days: 365 },
 }
 
-function cashfreeReq(method, endpoint, body) {
-  const isProd = process.env.CASHFREE_ENV === 'production'
-  const host = isProd ? 'api.cashfree.com' : 'sandbox.cashfree.com'
+// Owners use TEST Cashfree (free, test cards). Everyone else uses PRODUCTION (real money).
+function cashfreeCreds(owner) {
+  if (owner) {
+    return {
+      host: 'sandbox.cashfree.com',
+      appId: process.env.CASHFREE_TEST_APP_ID,
+      secret: process.env.CASHFREE_TEST_SECRET,
+      payHost: 'payments-test.cashfree.com'
+    }
+  }
+  return {
+    host: 'api.cashfree.com',
+    appId: process.env.CASHFREE_PROD_APP_ID,
+    secret: process.env.CASHFREE_PROD_SECRET,
+    payHost: 'payments.cashfree.com'
+  }
+}
+
+function cashfreeReq(creds, method, endpoint, body) {
   return new Promise((resolve, reject) => {
     const req = https.request({
-      host,
+      host: creds.host,
       path: `/pg${endpoint}`,
       method,
       headers: {
         'Content-Type': 'application/json',
-        'x-client-id': process.env.CASHFREE_APP_ID,
-        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
+        'x-client-id': creds.appId,
+        'x-client-secret': creds.secret,
         'x-api-version': '2023-08-01'
       }
     }, r => {
@@ -230,21 +307,26 @@ function cashfreeReq(method, endpoint, body) {
   })
 }
 
-app.post('/api/payment/create-order', checkAuth, async (req, res) => {
+app.post('/api/payment/create-order', checkAuth, requireUser, async (req, res) => {
   const { planId } = req.body
-  if (!process.env.CASHFREE_APP_ID) return res.json({ error: 'Payment not configured yet.' })
   const plan = PLAN_CONFIG[planId]
   if (!plan) return res.json({ error: 'Invalid plan.' })
 
+  const owner = !!req.user.owner
+  const creds = cashfreeCreds(owner)
+  if (!creds.appId || !creds.secret) {
+    return res.json({ error: `Payment not configured (${owner ? 'test' : 'production'}).` })
+  }
+
   const orderId = `INTRVW-${planId.toUpperCase()}-${Date.now()}`
   try {
-    const data = await cashfreeReq('POST', '/orders', {
+    const data = await cashfreeReq(creds, 'POST', '/orders', {
       order_id: orderId,
       order_amount: plan.amount,
       order_currency: 'INR',
       customer_details: {
         customer_id: `user-${Date.now()}`,
-        customer_email: 'user@intrvw.app',
+        customer_email: req.user.email || 'user@intrvw.app',
         customer_phone: '9999999999'
       },
       order_meta: { return_url: `https://intrvw.app/payment-success?order_id=${orderId}` }
@@ -253,10 +335,7 @@ app.post('/api/payment/create-order', checkAuth, async (req, res) => {
       console.error('[cashfree create]', JSON.stringify(data))
       return res.json({ error: 'Could not create order.' })
     }
-    const isProd = process.env.CASHFREE_ENV === 'production'
-    const paymentUrl = isProd
-      ? `https://payments.cashfree.com/order/#${data.payment_session_id}`
-      : `https://payments-test.cashfree.com/order/#${data.payment_session_id}`
+    const paymentUrl = `https://${creds.payHost}/order/#${data.payment_session_id}`
     return res.json({ orderId, paymentUrl })
   } catch (err) {
     console.error('[cashfree create]', err.message)
@@ -264,13 +343,13 @@ app.post('/api/payment/create-order', checkAuth, async (req, res) => {
   }
 })
 
-app.post('/api/payment/verify', checkAuth, async (req, res) => {
+app.post('/api/payment/verify', checkAuth, requireUser, async (req, res) => {
   const { orderId, planId } = req.body
+  const creds = cashfreeCreds(!!req.user.owner)
   try {
-    const data = await cashfreeReq('GET', `/orders/${orderId}`)
+    const data = await cashfreeReq(creds, 'GET', `/orders/${orderId}`)
     if (data.order_status !== 'PAID') return res.json({ paid: false })
 
-    // Tell the client what to grant — client applies it to local usage
     const plan = PLAN_CONFIG[planId] || {}
     return res.json({
       paid: true,
