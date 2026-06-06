@@ -96,50 +96,104 @@ app.post('/api/auth/google', checkAuth, async (req, res) => {
   }
 })
 
-// ── Audio: transcribe + answer ──────────────────────────────────────────────────
-app.post('/api/audio', checkAuth, async (req, res) => {
-  const { audio, role, resume } = req.body
-  if (!audio) return res.json({ skip: true })
+// Deepgram diarization — splits system audio into separate speakers (interviewers)
+async function deepgramDiarize(audioBase64) {
+  const key = process.env.DEEPGRAM_API_KEY
+  if (!key) throw new Error('Deepgram not configured')
+  const audio = Buffer.from(audioBase64, 'base64')
+  const url = 'https://api.deepgram.com/v1/listen?model=nova-2&diarize=true&punctuate=true&utterances=true&language=en'
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Token ${key}`, 'Content-Type': 'audio/webm' },
+    body: audio
+  })
+  if (!res.ok) throw new Error('Deepgram error ' + res.status)
+  const data = await res.json()
+  const utterances = data.results?.utterances || []
+  // Each utterance: { speaker: 0|1|2, transcript, start }
+  return utterances
+    .filter(u => u.transcript && u.transcript.trim())
+    .map(u => ({ speaker: u.speaker, text: u.transcript.trim(), start: u.start }))
+}
 
-  let tmpPath
+// Groq Whisper with timestamps — used for the candidate's mic
+async function transcribeMic(audioBase64) {
+  const tmpPath = path.join(os.tmpdir(), `intrvw-mic-${Date.now()}.webm`)
+  fs.writeFileSync(tmpPath, Buffer.from(audioBase64, 'base64'))
   try {
-    tmpPath = path.join(os.tmpdir(), `intrvw-${Date.now()}.webm`)
-    fs.writeFileSync(tmpPath, Buffer.from(audio, 'base64'))
+    const result = await getGroq().audio.transcriptions.create({
+      file: fs.createReadStream(tmpPath),
+      model: 'whisper-large-v3',
+      language: 'en',
+      response_format: 'verbose_json'
+    })
+    const segments = result.segments || []
+    return segments
+      .filter(s => s.text && s.text.trim())
+      .map(s => ({ text: s.text.trim(), start: s.start }))
+  } finally {
+    try { fs.unlinkSync(tmpPath) } catch {}
+  }
+}
 
-    let transcription
-    try {
-      const result = await getGroq().audio.transcriptions.create({
-        file: fs.createReadStream(tmpPath),
-        model: 'whisper-large-v3',
-        language: 'en',
-        prompt: 'Job interview. Interviewer asking candidate questions about experience, skills, background, and career goals.',
-        response_format: 'text'
-      })
-      transcription = typeof result === 'string' ? result : result.text || ''
-    } finally {
-      try { fs.unlinkSync(tmpPath) } catch {}
+// ── Audio: diarize + transcribe + answer ─────────────────────────────────────────
+app.post('/api/audio', checkAuth, async (req, res) => {
+  // micAudio = candidate (You); systemAudio = interviewer(s). `audio` kept for compat.
+  const { micAudio, systemAudio, audio, role, resume } = req.body
+  const sysSource = systemAudio || audio
+  if (!sysSource && !micAudio) return res.json({ skip: true })
+
+  try {
+    // Run diarization (interviewers) and mic transcription (you) in parallel
+    const [sysUtterances, micSegments] = await Promise.all([
+      sysSource ? deepgramDiarize(sysSource).catch(e => { console.error('[deepgram]', e.message); return [] }) : Promise.resolve([]),
+      micAudio  ? transcribeMic(micAudio).catch(e => { console.error('[mic]', e.message); return [] })       : Promise.resolve([])
+    ])
+
+    // Map Deepgram speaker numbers → "Interviewer N" (stable per request)
+    const speakerMap = {}
+    let nextInterviewer = 1
+    function interviewerLabel(spk) {
+      if (!(spk in speakerMap)) speakerMap[spk] = `Interviewer ${nextInterviewer++}`
+      return speakerMap[spk]
     }
 
-    const transcript = transcription.trim()
-    if (!transcript || transcript.length < 8) return res.json({ skip: true })
+    // Build a unified, time-ordered, labeled transcript
+    const lines = []
+    for (const u of sysUtterances) lines.push({ start: u.start, label: interviewerLabel(u.speaker), text: u.text })
+    for (const s of micSegments)   lines.push({ start: s.start, label: 'You', text: s.text })
+    lines.sort((a, b) => a.start - b.start)
 
-    let systemMsg = `You are helping an Indian candidate in a live job interview. Your job is simple — look at the transcript, find the question, and give a great answer.
+    // Merge consecutive lines from the same speaker for readability
+    const merged = []
+    for (const ln of lines) {
+      const last = merged[merged.length - 1]
+      if (last && last.label === ln.label) last.text += ' ' + ln.text
+      else merged.push({ label: ln.label, text: ln.text })
+    }
 
-Do NOT analyse who the question is addressed to. Do NOT skip based on names. Just answer.
+    const transcript = merged.map(m => `${m.label}: ${m.text}`).join('\n')
+    if (!transcript || transcript.replace(/(You|Interviewer \d+):/g, '').trim().length < 6) {
+      return res.json({ skip: true })
+    }
 
-If there is ANY question or topic — technical, behavioural, career goals, salary, background, motivation, or anything else — respond EXACTLY like this:
-QUESTION: <the question>
+    // Answer the interviewer's question(s) using the labeled transcript
+    let systemMsg = `You are helping an Indian candidate in a live job interview. Below is a snippet of the conversation with speaker labels — "You" is the candidate, "Interviewer 1/2/3" are the people interviewing.
+
+Find the most recent question(s) asked by ANY interviewer and write the answer the candidate should say. Ignore lines spoken by "You" except as context.
+
+Respond EXACTLY like this:
+QUESTION: <the interviewer's question, and which interviewer asked it>
 ANSWER: <the answer — see length rules below>
 
 LENGTH RULES:
-- For intro/self-introduction questions ("tell me about yourself", "introduce yourself", "walk me through your background", "tell me something about you"): write a FULL 2-minute spoken introduction — roughly 280-320 words. Cover: who you are, your education (college name, degree, year), your key technical skills, 2-3 specific projects or achievements from the resume with brief details, what you are looking for. Sound natural and warm, like a real Indian student talking in an interview, not reading a script.
-- For all other questions: 3-5 sentences is enough.
+- For intro/self-introduction questions ("tell me about yourself", "introduce yourself", "walk me through your background"): write a FULL 2-minute spoken introduction — roughly 280-320 words covering who you are, education (college, degree, year), key skills, 2-3 specific projects from the resume, and what you're looking for. Natural and warm, like a real Indian candidate talking.
+- For all other questions: 3-5 sentences.
 
-IMPORTANT: Always use the EXACT details from the resume — real college name, real project names, real skills. Never say vague things like "actively involved in various projects" — name the actual projects.
-
-Only respond with the single word SKIP (nothing else) if the transcript is pure noise, pure silence, or a completely cut-off fragment with no discernible topic.`
+Use the EXACT details from the resume — real college, project names, skills. Never be vague.
+Only respond with the single word SKIP if there is no interviewer question at all (just chit-chat or noise).`
     if (role) systemMsg += `\nRole being interviewed for: ${role}`
-    if (resume) systemMsg += `\nCandidate's resume (use these exact details in answers):\n${resume}`
+    if (resume) systemMsg += `\nCandidate's resume (use these exact details):\n${resume}`
 
     const chat = await getGroq().chat.completions.create({
       model: 'llama-3.1-8b-instant',
@@ -156,10 +210,11 @@ Only respond with the single word SKIP (nothing else) if the transcript is pure 
 
     const qMatch = reply.match(/QUESTION:\s*(.+?)(?:\nANSWER:|$)/s)
     const aMatch = reply.match(/ANSWER:\s*(.+)/s)
-    const question = qMatch?.[1]?.trim() || transcript
+    const question = qMatch?.[1]?.trim() || 'Interview question'
     const answer = aMatch?.[1]?.trim() || reply
 
-    return res.json({ question, answer })
+    // Return the labeled transcript too so the UI can show who said what
+    return res.json({ question, answer, transcript })
   } catch (err) {
     console.error('[audio]', err.message)
     return res.status(500).json({ error: err.message?.slice(0, 150) || 'Audio error' })
