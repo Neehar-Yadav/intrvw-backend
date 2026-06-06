@@ -14,7 +14,16 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '25mb' })) // audio/screenshots can be large
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+// Lazy init so a missing key doesn't crash the whole server on boot —
+// only AI calls will fail, while auth/payments still work.
+let _groq = null
+function getGroq() {
+  if (!_groq) {
+    if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not configured on the server')
+    _groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+  }
+  return _groq
+}
 
 // ── Google auth setup ────────────────────────────────────────────────────────────
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID
@@ -99,7 +108,7 @@ app.post('/api/audio', checkAuth, async (req, res) => {
 
     let transcription
     try {
-      const result = await groq.audio.transcriptions.create({
+      const result = await getGroq().audio.transcriptions.create({
         file: fs.createReadStream(tmpPath),
         model: 'whisper-large-v3',
         language: 'en',
@@ -132,7 +141,7 @@ Only respond with the single word SKIP (nothing else) if the transcript is pure 
     if (role) systemMsg += `\nRole being interviewed for: ${role}`
     if (resume) systemMsg += `\nCandidate's resume (use these exact details in answers):\n${resume}`
 
-    const chat = await groq.chat.completions.create({
+    const chat = await getGroq().chat.completions.create({
       model: 'llama-3.1-8b-instant',
       messages: [
         { role: 'system', content: systemMsg },
@@ -163,7 +172,7 @@ app.post('/api/screen', checkAuth, async (req, res) => {
   if (!screenshot) return res.status(400).json({ error: 'No screenshot' })
 
   try {
-    const extractRes = await groq.chat.completions.create({
+    const extractRes = await getGroq().chat.completions.create({
       model: 'meta-llama/llama-4-scout-17b-16e-instruct',
       messages: [{
         role: 'user',
@@ -186,7 +195,7 @@ For any intro or background question, mention specific details from the resume �
     if (resume) answerPrompt += `\nCandidate's resume (use these exact details):\n${resume}`
     answerPrompt += `\n\nQuestions:\n${extractedQuestions}`
 
-    const response = await groq.chat.completions.create({
+    const response = await getGroq().chat.completions.create({
       model: 'llama-3.1-8b-instant',
       messages: [{ role: 'user', content: answerPrompt }],
       max_tokens: 1200,
@@ -249,7 +258,7 @@ For any intro or background question, always use specific details from the resum
     }
 
     const model = lastShot ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.1-8b-instant'
-    const chat = await groq.chat.completions.create({ model, messages, temperature: 0.7, max_tokens: 700 })
+    const chat = await getGroq().chat.completions.create({ model, messages, temperature: 0.7, max_tokens: 700 })
     const answer = chat.choices[0]?.message?.content?.trim() || 'No response.'
     return res.json({ answer })
   } catch (err) {
