@@ -62,7 +62,7 @@ function checkAuth(req, res, next) {
 }
 
 // ── Health check ───────────────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ ok: true, service: 'intrvw-backend' }))
+app.get('/', (_, res) => res.json({ ok: true, service: 'intrvw-backend', version: 'screen-vision-v2' }))
 
 // ── Google login ──────────────────────────────────────────────────────────────────
 // The app sends the authorization code + the redirect URI it used. We exchange it
