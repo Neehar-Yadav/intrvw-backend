@@ -202,6 +202,7 @@ LENGTH RULES:
 - For all other questions: 3-5 sentences.
 
 Use the EXACT details from the resume — real college, project names, skills. Never be vague.
+NEVER write stage directions, emotions, or parenthetical actions like "(laughs)", "(smiling)", or "(pauses)". Output only the words the candidate should actually say.
 Only respond with the single word SKIP if the snippet has no question or topic at all — just pure noise or silence.`
     if (role) systemMsg += `\nRole being interviewed for: ${role}`
     if (resume) systemMsg += `\nCandidate's resume (use these exact details):\n${resume}`
@@ -238,38 +239,41 @@ app.post('/api/screen', checkAuth, async (req, res) => {
   if (!screenshot) return res.status(400).json({ error: 'No screenshot' })
 
   try {
-    const extractRes = await getGroq().chat.completions.create({
+    // SINGLE vision call — the model sees the questions AND their options, so it can
+    // pick the correct choice. No second blind step, no role-play.
+    let prompt = `You are an expert exam and test solver. The image is a screenshot of a candidate's screen showing one or more questions — multiple-choice, multi-select, coding problems, aptitude, or written questions.
+
+Solve EVERY question visible on the screen. For each one:
+- Start with "Q<n>:" and a short restatement of the question.
+- If it is multiple choice or multi-select, pick the correct option(s) EXACTLY as written on screen (copy the option text). If several are correct, list all of them. State the answer first, then one short line of reasoning.
+- If it is a coding problem, give clean, correct, working code in a code block.
+- Otherwise give a direct, correct, concise answer.
+
+STRICT RULES:
+- Be accurate. Only choose from the options actually shown on screen.
+- Do NOT role-play. Do NOT add stage directions, emotions, or filler like "(laughs)", "(smiling)", "I'm happy to oblige".
+- Do NOT give interview-style self-introductions or talk about a resume.
+- Just solve the questions clearly and correctly.
+If there are genuinely no questions on the screen, reply with exactly: NO_QUESTIONS`
+
+    const response = await getGroq().chat.completions.create({
       model: 'meta-llama/llama-4-scout-17b-16e-instruct',
       messages: [{
         role: 'user',
         content: [
           { type: 'image_url', image_url: { url: `data:image/png;base64,${screenshot}` } },
-          { type: 'text', text: 'Look at this screenshot. Extract EVERY question or problem statement you can see, numbered exactly as they appear. Output ONLY the list of questions, nothing else. If there are no questions, write: NO_QUESTIONS' }
+          { type: 'text', text: prompt }
         ]
       }],
-      max_tokens: 400
+      max_tokens: 1400,
+      temperature: 0.2
     })
 
-    const extractedQuestions = extractRes.choices[0]?.message?.content?.trim() || ''
-    if (!extractedQuestions || extractedQuestions === 'NO_QUESTIONS') {
-      return res.json({ noQuestions: true })
-    }
+    const answer = response.choices[0]?.message?.content?.trim() || ''
+    if (!answer || answer === 'NO_QUESTIONS') return res.json({ noQuestions: true })
 
-    let answerPrompt = `You are helping an Indian candidate in a job interview. Answer ALL the questions below the way a confident, well-spoken Indian professional would naturally say it — warm, direct, a little humble but not underconfident. Use simple everyday English, not stiff corporate language. Sound like a real person talking, not a textbook. Number your answers to match the questions.
-For any intro or background question, mention specific details from the resume — actual college, degree, skills, and projects. Never give a generic answer.`
-    if (role) answerPrompt += ` The candidate is applying for: ${role}.`
-    if (resume) answerPrompt += `\nCandidate's resume (use these exact details):\n${resume}`
-    answerPrompt += `\n\nQuestions:\n${extractedQuestions}`
-
-    const response = await getGroq().chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages: [{ role: 'user', content: answerPrompt }],
-      max_tokens: 1200,
-      temperature: 0.7
-    })
-
-    const answer = response.choices[0]?.message?.content?.trim() || 'Could not generate answers.'
-    return res.json({ answer, extractedQuestions })
+    // Use the full solved text as follow-up context too
+    return res.json({ answer, extractedQuestions: answer })
   } catch (err) {
     console.error('[screen]', err.message)
     return res.status(500).json({ error: err.message?.slice(0, 150) || 'Screen error' })
